@@ -1,0 +1,65 @@
+{
+  "config": {
+    "flow_title": "Salto ({host})",
+    "step": {
+      "user": {
+        "title": "Salto Bridge",
+        "description": "Connect to the ESP8266 RS485 bridge for an ABL Sursum EVCC wallbox.",
+        "data": {
+          "host": "Host / IP address",
+          "token": "API token"
+        },
+        "data_description": {
+          "host": "IP address of the bridge, e.g. 192.168.1.50 (use a DHCP reservation).",
+          "token": "API_TOKEN from the bridge's config.h."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Salto Bridge: new token",
+        "description": "The bridge rejected the token. Enter the current API_TOKEN.",
+        "data": {
+          "token": "API token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach the bridge.",
+      "invalid_auth": "Invalid token.",
+      "not_salto": "The device does not look like a Salto bridge (or its firmware is too old)."
+    },
+    "abort": {
+      "already_configured": "This bridge is already configured.",
+      "reauth_successful": "Token updated.",
+      "not_salto": "The device is not a Salto bridge."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "charging": { "name": "Charging" },
+      "car_connected": { "name": "Car connected" },
+      "charger_link": { "name": "Charger link" }
+    },
+    "number": {
+      "current_limit": { "name": "Charging current limit" }
+    },
+    "sensor": {
+      "status": {
+        "name": "Status",
+        "state": {
+          "no_car": "No car",
+          "connected": "Connected, waiting",
+          "charging": "Charging",
+          "disabled": "Disabled",
+          "transition": "Transition",
+          "unknown": "Unknown"
+        }
+      },
+      "charging_current": { "name": "Set charging current" },
+      "charging_power": { "name": "Set charging power" },
+      "default_current": { "name": "Default charging current" },
+      "status_code": { "name": "Status code" },
+      "charger_firmware": { "name": "Charger firmware" },
+      "wifi_signal": { "name": "WiFi signal" }
+    }
+  }
+}

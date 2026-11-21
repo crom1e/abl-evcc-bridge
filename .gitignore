@@ -1,0 +1,6 @@
+salto_bridge/config.h
+build/
+__pycache__/
+*.pyc
+todo.md
+CLAUDE.md

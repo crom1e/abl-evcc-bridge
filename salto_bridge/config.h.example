@@ -1,0 +1,27 @@
+// config.h - local configuration for salto_bridge.
+// Copy this file to config.h and fill in your own values.
+// config.h must NEVER be committed (it is listed in .gitignore).
+#pragma once
+
+// --- WiFi -------------------------------------------------------------
+#define WIFI_SSID      "my-network"
+#define WIFI_PASS      "wifi-password"
+#define HOSTNAME       "salto"          // gives salto.local via mDNS
+
+// --- Security ---------------------------------------------------------
+// Bearer token for all POST requests, /api/auth, /api/debug/* and telnet. Use a long random string.
+#define API_TOKEN      "change-me-to-a-long-random-string"
+// Password for ArduinoOTA (espota / arduino-cli upload over the network)
+#define OTA_PASSWORD   "change-me-ota"
+// Username/password for HTTP OTA at /update
+#define UPDATE_USER    "change-me-user"
+#define UPDATE_PASS    "change-me-update"
+
+// GET /api/status, /api/log and the web page are open without a token when 1.
+// Set to 0 to require the token there as well (the web page then reads it from the URL: http://salto.local/#<token>).
+#define READONLY_STATUS_OPEN 1
+
+// --- The only safeguard in the ESP -----------------------------------------
+// Highest charging current (A) HA may set. Default 16, never above 30. Must not exceed
+// what the circuit and the charger's own default/maximum allow.
+#define MAX_A          16

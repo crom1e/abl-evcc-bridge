@@ -1,0 +1,5 @@
+{
+  "name": "Salto Bridge (ABL EVCC)",
+  "render_readme": true,
+  "homeassistant": "2025.1.0"
+}

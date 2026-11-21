@@ -1,0 +1,65 @@
+{
+  "config": {
+    "flow_title": "Salto ({host})",
+    "step": {
+      "user": {
+        "title": "Salto Bridge",
+        "description": "Koble til ESP8266-RS485-broen for en ABL Sursum EVCC-lader.",
+        "data": {
+          "host": "Vert / IP-adresse",
+          "token": "API-token"
+        },
+        "data_description": {
+          "host": "IP-adressen til broen, f.eks. 192.168.1.50 (bruk en DHCP-reservasjon).",
+          "token": "API_TOKEN fra broens config.h."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Salto Bridge: nytt token",
+        "description": "Broen avviste tokenet. Skriv inn gjeldende API_TOKEN.",
+        "data": {
+          "token": "API-token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Får ikke kontakt med broen.",
+      "invalid_auth": "Ugyldig token.",
+      "not_salto": "Enheten ser ikke ut som en Salto-bro (eller har for gammel firmware)."
+    },
+    "abort": {
+      "already_configured": "Denne broen er allerede satt opp.",
+      "reauth_successful": "Tokenet er oppdatert.",
+      "not_salto": "Enheten er ikke en Salto-bro."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "charging": { "name": "Lader" },
+      "car_connected": { "name": "Bil tilkoblet" },
+      "charger_link": { "name": "Kontakt med lader" }
+    },
+    "number": {
+      "current_limit": { "name": "Ladestrømgrense" }
+    },
+    "sensor": {
+      "status": {
+        "name": "Status",
+        "state": {
+          "no_car": "Ingen bil",
+          "connected": "Tilkoblet, venter",
+          "charging": "Lader",
+          "disabled": "Deaktivert",
+          "transition": "Overgang",
+          "unknown": "Ukjent"
+        }
+      },
+      "charging_current": { "name": "Satt ladestrøm" },
+      "charging_power": { "name": "Satt ladeeffekt" },
+      "default_current": { "name": "Standard ladestrøm" },
+      "status_code": { "name": "Statuskode" },
+      "charger_firmware": { "name": "Lader-firmware" },
+      "wifi_signal": { "name": "WiFi-signal" }
+    }
+  }
+}
