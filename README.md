@@ -136,7 +136,7 @@ curl -X POST -H "$H" http://<ip>/api/debug/reboot
 | Endpoint | Response |
 |---|---|
 | `GET /api/status` | see the fields below |
-| `GET /api/log` | `commands[]`: last 20 (`ms, amps, raw, source, ok, error`). `frames[]`: last 50 RS485 frames (`ms, dir tx/rx, ascii, hex`). Both newest first. `now_ms` = current millis. |
+| `GET /api/log` | `commands[]`: last 20 (`ms, time, amps, raw, source, ok, error`). `frames[]`: last 50 RS485 frames (`ms, time, dir tx/rx, ascii, hex`). Both newest first. `time` is local wall-clock time from NTP (frames with milliseconds), `null` until the clock is set. `now_ms` = current millis. |
 | `GET /api/auth` | `{"ok": true}` if the token is valid. Never touches the charger. |
 | `GET /api/anomalies` | Persistent log (token required): the last 100 rejected or odd frames, newest first, kept across reboots. Each entry: `time` (local, `null` before NTP sync), `uptime_s`, `boot`, `kind` (`invalid`, `out_of_range`, `unconfirmed`, `stray`, `suppressed`), `cmd`, `held` (value the bridge held), `ascii`, `hex`. See [reading integrity](#reading-integrity). |
 | `POST /api/anomalies/clear` | clears the anomaly log (token required) |

@@ -152,6 +152,22 @@ void fmtLocalTime(uint32_t epoch, char* out, size_t cap) {
   strftime(out, cap, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
+// Local wall-clock time of an event recorded at millis() = atMs, e.g. "2026-11-22 10:40:55.123".
+// Derived from the current time minus the event's age, so it also works for events logged before
+// the NTP sync. Empty string while the clock is not set.
+void fmtEventTime(uint32_t atMs, char* out, size_t cap, bool withMs) {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  if (tv.tv_sec < 1700000000) { out[0] = 0; return; }
+  uint64_t nowEpochMs = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+  uint64_t evMs = nowEpochMs - (uint32_t)(millis() - atMs);
+  time_t t = (time_t)(evMs / 1000);
+  struct tm tm;
+  localtime_r(&t, &tm);
+  size_t n = strftime(out, cap, "%Y-%m-%d %H:%M:%S", &tm);
+  if (withMs && n + 4 < cap) snprintf(out + n, cap - n, ".%03u", (unsigned)(evMs % 1000));
+}
+
 // ---------------------------------------------------------------------------
 // Ring buffers: raw frames (50) and commands (20)
 // ---------------------------------------------------------------------------
@@ -799,13 +815,18 @@ void handleLog() {
   server.send(200, "application/json", "");
   String chunk;
   chunk.reserve(512);
+  char ts[28];
   chunk = "{\"now_ms\":";
   chunk += millis();
+  fmtEventTime(millis(), ts, sizeof ts, false);
+  chunk += ",\"time\":"; chunk += ts[0] ? jsonStr(ts) : String("null");
   chunk += ",\"commands\":[";
   for (uint8_t i = 0; i < cmdCount; i++) {
     const CmdEntry& c = cmdLog[(cmdHead + CMD_N - 1 - i) % CMD_N];
     if (i) chunk += ',';
+    fmtEventTime(c.ms, ts, sizeof ts, false);
     chunk += "{\"ms\":"; chunk += c.ms;
+    chunk += ",\"time\":"; chunk += ts[0] ? jsonStr(ts) : String("null");
     chunk += ",\"amps\":"; chunk += c.amps;
     chunk += ",\"raw\":"; chunk += c.raw;
     chunk += ",\"source\":"; chunk += jsonStr(c.source);
@@ -820,7 +841,9 @@ void handleLog() {
     char hx[120];
     textToHex(r.txt, hx, sizeof hx);
     if (i) chunk += ',';
+    fmtEventTime(r.ms, ts, sizeof ts, true);
     chunk += "{\"ms\":"; chunk += r.ms;
+    chunk += ",\"time\":"; chunk += ts[0] ? jsonStr(ts) : String("null");
     chunk += ",\"dir\":"; chunk += r.tx ? "\"tx\"" : "\"rx\"";
     chunk += ",\"ascii\":"; chunk += jsonStr(r.txt);
     chunk += ",\"hex\":"; chunk += jsonStr(hx);
@@ -1000,7 +1023,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;p
 <h2>Commands</h2>
 <div class="card scroll"><table><thead><tr><th>Time</th><th>Value</th><th>Source</th><th>Result</th></tr></thead><tbody id="cmds"></tbody></table></div>
 <h2>RS485 frames</h2>
-<div class="card scroll"><table><thead><tr><th>ms</th><th></th><th>ASCII</th><th>Hex</th></tr></thead><tbody id="frames"></tbody></table></div>
+<div class="card scroll"><table><thead><tr><th>Time</th><th></th><th>ASCII</th><th>Hex</th></tr></thead><tbody id="frames"></tbody></table></div>
 </main><script>
 const tok=location.hash.slice(1),H=tok?{headers:{Authorization:'Bearer '+tok}}:{};
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -1024,9 +1047,9 @@ async function tick(){
   $('sys').innerHTML=rows.map(r=>`<tr><th>${r[0]}</th><td>${esc(r[1])}</td></tr>`).join('');
  }catch(e){$('on').textContent='● no connection';$('on').className='bad'}
  try{const l=await (await fetch('/api/log',H)).json();nowMs=l.now_ms;
-  const ago=ms=>dur(Math.round((nowMs-ms)/1000))+' ago';
-  $('cmds').innerHTML=l.commands.map(c=>`<tr><td>${ago(c.ms)}</td><td>${c.amps} A <span class="mut">(${c.raw})</span></td><td>${esc(c.source)}</td><td class="${c.ok?'ok':'bad'}">${c.ok?'OK':esc(c.error||'error')}</td></tr>`).join('');
-  $('frames').innerHTML=l.frames.map(f=>`<tr><td>${f.ms}</td><td>${f.dir}</td><td class="mono">${esc(f.ascii)}</td><td class="mono">${esc(f.hex)}</td></tr>`).join('');
+  const ago=ms=>dur(Math.round((nowMs-ms)/1000))+' ago',hms=t=>t?t.slice(11):null;
+  $('cmds').innerHTML=l.commands.map(c=>`<tr><td title="${ago(c.ms)}">${esc(c.time||ago(c.ms))}</td><td>${c.amps} A <span class="mut">(${c.raw})</span></td><td>${esc(c.source)}</td><td class="${c.ok?'ok':'bad'}">${c.ok?'OK':esc(c.error||'error')}</td></tr>`).join('');
+  $('frames').innerHTML=l.frames.map(f=>`<tr><td class="mono" title="${f.time||''} (millis ${f.ms})">${esc(hms(f.time)||f.ms)}</td><td>${f.dir}</td><td class="mono">${esc(f.ascii)}</td><td class="mono">${esc(f.hex)}</td></tr>`).join('');
  }catch(e){}
 }
 tick();setInterval(tick,2000);
@@ -1088,12 +1111,16 @@ void telnetLog() {
   tprintf("-- commands (newest first) --\r\n");
   for (uint8_t i = 0; i < cmdCount; i++) {
     const CmdEntry& c = cmdLog[(cmdHead + CMD_N - 1 - i) % CMD_N];
-    tprintf("%10lu %3d A raw %4u %-6s %s %s\r\n", (unsigned long)c.ms, c.amps, c.raw, c.source, c.ok ? "OK" : "FAILED", c.err);
+    char ts[28];
+    fmtEventTime(c.ms, ts, sizeof ts, false);
+    tprintf("%-19s %3d A raw %4u %-6s %s %s\r\n", ts[0] ? ts : "-", c.amps, c.raw, c.source, c.ok ? "OK" : "FAILED", c.err);
   }
   tprintf("-- latest frames (newest first) --\r\n");
   for (uint8_t i = 0; i < rawCount && i < 20; i++) {
     const RawFrame& r = rawLog[(rawHead + RAW_N - 1 - i) % RAW_N];
-    tprintf("%10lu %s %s\r\n", (unsigned long)r.ms, r.tx ? "TX" : "RX", r.txt);
+    char ts[28];
+    fmtEventTime(r.ms, ts, sizeof ts, true);
+    tprintf("%-12s %s %s\r\n", ts[0] ? ts + 11 : "-", r.tx ? "TX" : "RX", r.txt);
   }
 }
 
