@@ -6,7 +6,9 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-tools/salto.sh build [version]     compile into build/ (version: git hash or date)
+tools/salto.sh build [version]     compile into build/ (version from manifest.json, see 'version')
+tools/salto.sh version             print the version the next build gets (X.Y.Z or X.Y.Z-dev.<hash>)
+tools/salto.sh release X.Y.Z       set version, commit, tag vX.Y.Z, push and create a GitHub release
 tools/salto.sh ota                 build + upload via arduino-cli/espota (ArduinoOTA)
 tools/salto.sh ota-http            build + upload build/*.bin via curl to /update
 tools/salto.sh verify [version]    wait until /api/status reports the version (default: last build)
@@ -73,15 +75,59 @@ resolve_ip() {  # mDNS name -> IP (curl/python on Windows cannot resolve .local;
   echo "$ip"
 }
 
+MANIFEST="$ROOT/custom_components/salto_bridge/manifest.json"
+
+# The single version number for firmware and integration lives in manifest.json.
+manifest_version() {
+  sed -nE 's/^[[:space:]]*"version":[[:space:]]*"([^"]+)".*/\1/p' "$MANIFEST" | head -1
+}
+
+# Firmware version string:
+#   X.Y.Z                         clean tree, HEAD tagged vX.Y.Z (a release)
+#   X.Y.Z-dev.<hash>              between releases
+#   X.Y.Z-dev.<hash>-dirty.HHMMSS uncommitted changes
 version_string() {
   if [ -n "${1:-}" ]; then echo "$1"; return; fi
-  if git -C "$ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
-    local v; v="$(git -C "$ROOT" rev-parse --short HEAD)"
-    git -C "$ROOT" diff --quiet HEAD -- 2>/dev/null || v="$v-dirty-$(date +%H%M%S)"
-    echo "$v"
-  else
-    date +%Y%m%d-%H%M%S
+  local base; base="$(manifest_version)"
+  [ -n "$base" ] || base="0.0.0"
+  if ! git -C "$ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
+    echo "$base-dev.$(date +%Y%m%d%H%M%S)"; return
   fi
+  local hash dirty=""
+  hash="$(git -C "$ROOT" rev-parse --short HEAD)"
+  git -C "$ROOT" diff --quiet HEAD -- 2>/dev/null || dirty="-dirty.$(date +%H%M%S)"
+  if [ -z "$dirty" ] && [ "$(git -C "$ROOT" tag --points-at HEAD | grep -cx "v$base")" = 1 ]; then
+    echo "$base"
+  else
+    echo "$base-dev.$hash$dirty"
+  fi
+}
+
+find_gh() {
+  if command -v gh >/dev/null 2>&1; then echo gh; return; fi
+  local p="${LOCALAPPDATA:-}/Programs/gh/bin/gh.exe"
+  p="$(cygpath -u "$p" 2>/dev/null || echo "$p")"
+  [ -x "$p" ] && { echo "$p"; return; }
+  echo "gh (GitHub CLI) not found" >&2; exit 1
+}
+
+# release X.Y.Z: set the version in manifest.json, commit, tag vX.Y.Z, push, create a GitHub release.
+release() {
+  local v="${1:?usage: release X.Y.Z}"
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be X.Y.Z" >&2; exit 1; }
+  git -C "$ROOT" diff --quiet HEAD -- || { echo "commit or stash your changes first" >&2; exit 1; }
+  git -C "$ROOT" rev-parse -q --verify "refs/tags/v$v" >/dev/null && { echo "tag v$v already exists" >&2; exit 1; }
+  local gh; gh="$(find_gh)"
+  if [ "$(manifest_version)" != "$v" ]; then
+    sed -i -E "s/^([[:space:]]*\"version\":[[:space:]]*\")[^\"]+(\".*)/\1$v\2/" "$MANIFEST"
+    git -C "$ROOT" add "$MANIFEST"
+    git -C "$ROOT" commit -q -m "Release $v"
+  fi
+  git -C "$ROOT" tag -a "v$v" -m "Release $v"
+  git -C "$ROOT" push -q
+  git -C "$ROOT" push -q origin "v$v"
+  (cd "$ROOT" && "$gh" release create "v$v" --title "$v" --generate-notes)
+  echo ">> released $v - build and flash with: tools/salto.sh ota-http && tools/salto.sh verify"
 }
 
 build() {
@@ -149,6 +195,8 @@ case "$cmd" in
   ota)      ota "${1:-}" ;;
   ota-http) ota_http "${1:-}" ;;
   verify)   verify "${1:-}" ;;
+  version)  version_string ;;
+  release)  release "${1:-}" ;;
   status)   api GET /api/status ;;
   log)      api GET /api/log ;;
   anomalies) api GET /api/anomalies ;;

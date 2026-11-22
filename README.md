@@ -73,12 +73,29 @@ cp salto_bridge/config.h.example salto_bridge/config.h   # fill in WiFi, token a
 ### Build
 
 ```bash
-arduino-cli compile --fqbn esp8266:esp8266:d1_mini --output-dir build \
-  --build-property "compiler.cpp.extra_flags=-DFW_VERSION_RAW=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d-%H%M)" \
-  salto_bridge
-# -> build/salto_bridge.ino.bin
+tools/salto.sh build      # -> build/salto_bridge.ino.bin, version in build/version.txt
 ```
-The version is stringified in the code, so no quotes are needed. Without `FW_VERSION_RAW` the version is `dev`. Shortcut: `tools/salto.sh build`.
+Or directly with arduino-cli (the version is stringified in the code, so no quotes are needed; without `FW_VERSION_RAW` it is `dev`):
+```bash
+arduino-cli compile --fqbn esp8266:esp8266:d1_mini --output-dir build \
+  --build-property "compiler.cpp.extra_flags=-DFW_VERSION_RAW=0.2.0" salto_bridge
+```
+
+### Versioning
+
+Firmware and integration share one version number, `version` in `custom_components/salto_bridge/manifest.json`. Releases are git tags `vX.Y.Z` with a GitHub release, which is also what HACS offers.
+
+| Build from | Firmware version (`fw_version`) |
+|---|---|
+| a release (clean tree, HEAD tagged `vX.Y.Z`) | `X.Y.Z` |
+| a commit between releases | `X.Y.Z-dev.<hash>` |
+| uncommitted changes | `X.Y.Z-dev.<hash>-dirty.<HHMMSS>` |
+
+```bash
+tools/salto.sh version          # what the next build will be called
+tools/salto.sh release 0.2.1    # bump manifest, commit, tag v0.2.1, push, create GitHub release
+tools/salto.sh ota-http && tools/salto.sh verify
+```
 
 ### First flash over USB
 
