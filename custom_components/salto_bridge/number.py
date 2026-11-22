@@ -45,7 +45,14 @@ class SaltoCurrentLimit(SaltoEntity, NumberEntity):
 
     @property
     def native_value(self) -> float | None:
-        return self.coordinator.data.get("applied_a")
+        amps = self.coordinator.data.get("applied_a")
+        if amps is None:
+            return None
+        # Outside the slider range (0 = no current, or a value the coordinator did not catch):
+        # report unknown rather than a number an automation could act on.
+        if not self.native_min_value <= amps <= self.native_max_value:
+            return None
+        return amps
 
     async def async_set_native_value(self, value: float) -> None:
         amps = int(round(value))

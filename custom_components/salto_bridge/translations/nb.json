@@ -59,7 +59,9 @@
       "default_current": { "name": "Standard ladestrøm" },
       "status_code": { "name": "Statuskode" },
       "charger_firmware": { "name": "Lader-firmware" },
-      "wifi_signal": { "name": "WiFi-signal" }
+      "wifi_signal": { "name": "WiFi-signal" },
+      "rejected_readings": { "name": "Forkastede avlesninger" },
+      "anomaly_log_entries": { "name": "Oppføringer i avviksloggen" }
     }
   }
 }

@@ -10,7 +10,8 @@ tools/salto.sh build [version]     compile into build/ (version: git hash or dat
 tools/salto.sh ota                 build + upload via arduino-cli/espota (ArduinoOTA)
 tools/salto.sh ota-http            build + upload build/*.bin via curl to /update
 tools/salto.sh verify [version]    wait until /api/status reports the version (default: last build)
-tools/salto.sh status | log
+tools/salto.sh status | log | anomalies
+tools/salto.sh anomalies-clear    clear the persistent anomaly log
 tools/salto.sh current <A>         set charging current (6..MAX_A) - affects a real charger!
 tools/salto.sh level <debug|info|warn> | reboot
 tools/salto.sh telnet "<cmd>" ...  log in over telnet, run commands, print output
@@ -150,6 +151,8 @@ case "$cmd" in
   verify)   verify "${1:-}" ;;
   status)   api GET /api/status ;;
   log)      api GET /api/log ;;
+  anomalies) api GET /api/anomalies ;;
+  anomalies-clear) api POST /api/anomalies/clear ;;
   current)  api POST /api/current "{\"amps\": ${1:?amps}}" ;;
   level)    api POST /api/debug/loglevel "{\"level\": \"${1:?level}\"}" ;;
   reboot)   api POST /api/debug/reboot ;;

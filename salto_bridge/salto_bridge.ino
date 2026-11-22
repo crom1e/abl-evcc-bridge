@@ -16,6 +16,8 @@
 #include <ArduinoOTA.h>
 #include <SoftwareSerial.h>
 #include <ArduinoJson.h>
+#include <LittleFS.h>
+#include <time.h>
 #include <stdarg.h>
 #include "config.h"
 #include "types.h"
@@ -43,6 +45,12 @@ static_assert(MAX_A >= 6 && MAX_A <= 30, "MAX_A must be between 6 and 30");
 #ifndef READONLY_STATUS_OPEN
 #define READONLY_STATUS_OPEN 1
 #endif
+#ifndef NTP_SERVER
+#define NTP_SERVER "pool.ntp.org"
+#endif
+#ifndef TZ_INFO
+#define TZ_INFO "CET-1CEST,M3.5.0,M10.5.0/3"   // Europe/Oslo
+#endif
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -51,6 +59,7 @@ static const int      MIN_A           = 6;      // the charger rejects lower val
 static const uint32_t RS_BAUD         = 38400;  // 8N1
 static const uint32_t RESP_TIMEOUT_MS = 300;    // the charger typically answers within 4-7 ms
 static const uint32_t WRITE_GAP_MS    = 60;     // gap between the two transmissions of a write
+static const uint8_t  READ_SENDS      = 3;      // reads: up to 3 attempts (retry on failure / to confirm a change)
 static const uint32_t POLL_MS         = 5000;
 static const uint32_t ONLINE_MS       = 15000;
 static const uint8_t  SLOW_POLL_EVERY = 12;     // "!0 26" and "!0 01" every 12th poll (1 min)
@@ -116,15 +125,31 @@ bool ctEquals(const char* given, const char* secret) {
   return diff == 0;
 }
 
-void textToHex(const char* s, char* out, size_t cap) {
+void bytesToHex(const uint8_t* b, size_t n, char* out, size_t cap) {
   static const char HEXC[] = "0123456789ABCDEF";
   size_t p = 0;
-  for (size_t i = 0; s[i] && p + 3 < cap; i++) {
+  for (size_t i = 0; i < n && p + 3 < cap; i++) {
     if (i) out[p++] = ' ';
-    out[p++] = HEXC[(uint8_t)s[i] >> 4];
-    out[p++] = HEXC[(uint8_t)s[i] & 0xF];
+    out[p++] = HEXC[b[i] >> 4];
+    out[p++] = HEXC[b[i] & 0xF];
   }
   out[p] = 0;
+}
+
+void textToHex(const char* s, char* out, size_t cap) { bytesToHex((const uint8_t*)s, strlen(s), out, cap); }
+
+// Unix time from NTP, 0 until the clock has been set
+uint32_t nowEpoch() {
+  time_t t = time(nullptr);
+  return t > 1700000000 ? (uint32_t)t : 0;
+}
+
+void fmtLocalTime(uint32_t epoch, char* out, size_t cap) {
+  if (!epoch) { out[0] = 0; return; }
+  time_t t = epoch;
+  struct tm tm;
+  localtime_r(&t, &tm);
+  strftime(out, cap, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +195,9 @@ void cmdAdd(int amps, uint16_t raw, const char* source, bool ok, const char* err
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-struct Counters { uint32_t sent, recv, invalid, timeouts; } counters = {0, 0, 0, 0};
+// invalid:  malformed replies. rejected: well-formed values that were discarded (out of range or
+// not confirmed by a repeated read). stray: bytes that arrived when no reply was expected.
+struct Counters { uint32_t sent, recv, invalid, timeouts, rejected, stray; } counters = {0, 0, 0, 0, 0, 0};
 
 AblValue ablStatus = {false, "", 0};   // !0 02
 AblValue ablCur    = {false, "", 0};   // !0 11  present current limit (duty x10)
@@ -191,6 +218,156 @@ uint32_t rebootAt = 0;
 String   resetReason;
 
 // ---------------------------------------------------------------------------
+// Persistent anomaly log (LittleFS, /anomaly.bin): the last 100 rejected or odd frames,
+// kept across reboots so incidents can be analysed afterwards. Ring of fixed-size records.
+// Flash wear: records are buffered in RAM, flushed at most every 10 s, max 30 per hour.
+// ---------------------------------------------------------------------------
+static const char     ANOM_FILE[]    = "/anomaly.bin";
+static const uint32_t ANOM_MAGIC     = 0x314D4E41;   // "ANM1"
+static const uint16_t ANOM_N         = 100;
+static const uint8_t  ANOM_PENDING_N = 8;
+static const uint32_t ANOM_FLUSH_MS  = 10000;
+static const uint8_t  ANOM_PER_HOUR  = 30;
+static const char* const ANOM_NAME[] = {"none", "invalid", "out_of_range", "unconfirmed", "stray", "suppressed"};
+
+struct AnomHeader { uint32_t magic; uint16_t head, count; uint32_t bootNo; };
+AnomHeader anomHdr = {0, 0, 0, 0};
+bool       fsOk = false;
+AnomalyRec anomPending[ANOM_PENDING_N];
+uint8_t    anomPendingN = 0;
+uint32_t   anomSuppressed = 0;     // not yet written because of the limits
+uint32_t   anomSinceBoot = 0;
+uint32_t   anomLastFlush = 0, anomHourStart = 0;
+uint8_t    anomHourCount = 0;
+
+static const size_t ANOM_FILE_SIZE = sizeof(AnomHeader) + (size_t)ANOM_N * sizeof(AnomalyRec);
+
+bool anomWriteHeader(File& f) {
+  f.seek(0, SeekSet);
+  return f.write((const uint8_t*)&anomHdr, sizeof anomHdr) == sizeof anomHdr;
+}
+
+void anomBegin() {
+  fsOk = LittleFS.begin();   // formats the FS on first use
+  if (!fsOk) { LOGE("LittleFS mount failed - anomaly log not persisted"); return; }
+  bool good = false;
+  File f = LittleFS.open(ANOM_FILE, "r");
+  if (f) {
+    good = f.size() == ANOM_FILE_SIZE && f.read((uint8_t*)&anomHdr, sizeof anomHdr) == sizeof anomHdr &&
+           anomHdr.magic == ANOM_MAGIC && anomHdr.head < ANOM_N && anomHdr.count <= ANOM_N;
+    f.close();
+  }
+  if (!good) {
+    uint32_t boot = anomHdr.magic == ANOM_MAGIC ? anomHdr.bootNo : 0;
+    anomHdr = {ANOM_MAGIC, 0, 0, boot};
+    f = LittleFS.open(ANOM_FILE, "w");
+    if (!f) { fsOk = false; LOGE("cannot create %s", ANOM_FILE); return; }
+    f.write((const uint8_t*)&anomHdr, sizeof anomHdr);
+    AnomalyRec z;
+    memset(&z, 0, sizeof z);
+    for (uint16_t i = 0; i < ANOM_N; i++) f.write((const uint8_t*)&z, sizeof z);
+    f.close();
+    LOGI("anomaly log created (%u bytes)", (unsigned)ANOM_FILE_SIZE);
+  }
+  anomHdr.bootNo++;
+  f = LittleFS.open(ANOM_FILE, "r+");
+  if (!f || !anomWriteHeader(f)) { fsOk = false; LOGE("cannot write %s", ANOM_FILE); }
+  if (f) f.close();
+  LOGI("boot #%u, anomaly log has %u entries", anomHdr.bootNo, anomHdr.count);
+}
+
+void anomAdd(AnomalyKind kind, const char* cmd, const char* stored, const uint8_t* rx, size_t rxLen) {
+  anomSinceBoot++;
+  char hx[80];
+  bytesToHex(rx, rxLen, hx, sizeof hx);
+  LOGW("anomaly %s on %s: rx [%s] (held value %s)", ANOM_NAME[kind], cmd, hx, stored);
+  if (anomPendingN >= ANOM_PENDING_N) { anomSuppressed++; return; }
+  AnomalyRec& r = anomPending[anomPendingN++];
+  memset(&r, 0, sizeof r);
+  r.epoch = nowEpoch();
+  r.uptimeS = (uint32_t)(millis() / 1000);
+  r.bootNo = anomHdr.bootNo;
+  r.kind = kind;
+  strlcpy(r.cmd, cmd, sizeof r.cmd);
+  strlcpy(r.stored, stored, sizeof r.stored);
+  r.rxLen = (uint8_t)min(rxLen, sizeof r.rx);
+  memcpy(r.rx, rx, r.rxLen);
+}
+
+bool anomWriteRec(File& f, const AnomalyRec& r) {
+  f.seek(sizeof(AnomHeader) + (size_t)anomHdr.head * sizeof(AnomalyRec), SeekSet);
+  if (f.write((const uint8_t*)&r, sizeof r) != sizeof r) return false;
+  anomHdr.head = (anomHdr.head + 1) % ANOM_N;
+  if (anomHdr.count < ANOM_N) anomHdr.count++;
+  anomHourCount++;
+  return true;
+}
+
+void anomTick() {
+  uint32_t now = millis();
+  if (now - anomHourStart >= 3600000UL) { anomHourStart = now; anomHourCount = 0; }
+  if (!anomPendingN && !anomSuppressed) return;
+  if (now - anomLastFlush < ANOM_FLUSH_MS) return;
+  anomLastFlush = now;
+  if (!fsOk) { anomPendingN = 0; anomSuppressed = 0; return; }
+  if (anomHourCount >= ANOM_PER_HOUR) {   // budget used up: count only
+    anomSuppressed += anomPendingN;
+    anomPendingN = 0;
+    return;
+  }
+  File f = LittleFS.open(ANOM_FILE, "r+");
+  if (!f) { LOGE("cannot open %s", ANOM_FILE); return; }
+  if (anomSuppressed) {
+    AnomalyRec s;
+    memset(&s, 0, sizeof s);
+    s.epoch = nowEpoch();
+    s.uptimeS = (uint32_t)(millis() / 1000);
+    s.bootNo = anomHdr.bootNo;
+    s.kind = A_SUPPRESSED;
+    s.extra = (uint16_t)min<uint32_t>(anomSuppressed, 65535);
+    strlcpy(s.cmd, "-", sizeof s.cmd);
+    strlcpy(s.stored, "-", sizeof s.stored);
+    if (anomWriteRec(f, s)) anomSuppressed = 0;
+  }
+  for (uint8_t i = 0; i < anomPendingN; i++) {
+    if (anomHourCount >= ANOM_PER_HOUR) { anomSuppressed++; continue; }
+    anomWriteRec(f, anomPending[i]);
+  }
+  anomPendingN = 0;
+  anomWriteHeader(f);
+  f.close();
+}
+
+void anomClear() {
+  anomPendingN = 0;
+  anomSuppressed = 0;
+  anomHdr.head = 0;
+  anomHdr.count = 0;
+  if (!fsOk) return;
+  File f = LittleFS.open(ANOM_FILE, "r+");
+  if (f) { anomWriteHeader(f); f.close(); }
+}
+
+// Calls fn(record) newest first: unflushed records, then the file. Returns the number visited.
+template <typename F>
+uint16_t anomForEach(uint16_t maxN, F fn) {
+  uint16_t n = 0;
+  for (int i = anomPendingN - 1; i >= 0 && n < maxN; i--, n++) fn(anomPending[i]);
+  if (!fsOk || !anomHdr.count) return n;
+  File f = LittleFS.open(ANOM_FILE, "r");
+  if (!f) return n;
+  AnomalyRec r;
+  for (uint16_t i = 0; i < anomHdr.count && n < maxN; i++, n++) {
+    uint16_t slot = (anomHdr.head + ANOM_N - 1 - i) % ANOM_N;
+    f.seek(sizeof(AnomHeader) + (size_t)slot * sizeof(AnomalyRec), SeekSet);
+    if (f.read((uint8_t*)&r, sizeof r) != sizeof r) break;
+    fn(r);
+  }
+  f.close();
+  return n;
+}
+
+// ---------------------------------------------------------------------------
 // RS485 job queue and state machine (ABL ASCII protocol)
 // ---------------------------------------------------------------------------
 SoftwareSerial rs;
@@ -199,7 +376,7 @@ struct Job {
   uint16_t id;
   Purpose  purpose;
   char     cmd[20];     // e.g. "!0 12 0267" (without CRLF)
-  uint8_t  sends;       // writes: always 2 transmissions. reads: up to 2 (retry on failure)
+  uint8_t  sends;       // writes: always 2 transmissions. reads: up to READ_SENDS (retry / confirm)
   int16_t  amps;
   uint16_t raw;
   char     source[8];
@@ -227,8 +404,19 @@ bool     gotValid = false;
 uint32_t tJobStart = 0, tAttempt = 0, tGap = 0;
 
 static const size_t RXMAX = 40;
-char     rxBuf[RXMAX];
+char     rxBuf[RXMAX];       // printable copy of the reply (non-printables as '.')
 size_t   rxLen = 0;
+uint8_t  rxRaw[24];          // the same reply as raw bytes, for the anomaly log
+size_t   rxRawLen = 0;
+
+// The ABL ASCII protocol has no checksum, and SoftwareSerial occasionally flips a bit. A flip can
+// turn one digit into another ("0183" = 11 A -> "0383" = 23 A) and still look valid. Therefore a
+// read value that differs from the held one is only accepted once a second read in the same job
+// returns the same value (or it is the value we just wrote).
+char     candVal[12];        // changed value seen in this job, waiting for confirmation
+uint8_t  candRaw[24];
+uint8_t  candRawLen = 0;
+int32_t  expectCurRaw = -1;  // "!0 11" value expected right after a successful "!0 12" write
 
 static inline bool isWrite(Purpose p) { return p == P_SET; }
 
@@ -239,7 +427,7 @@ uint16_t enqueue(Purpose p, const char* cmd, const char* source, int amps = 0, u
   if (nextJobId == 0) nextJobId = 1;
   j.purpose = p;
   strlcpy(j.cmd, cmd, sizeof j.cmd);
-  j.sends = 2;
+  j.sends = isWrite(p) ? 2 : READ_SENDS;
   j.amps = amps;
   j.raw = raw;
   strlcpy(j.source, source, sizeof j.source);
@@ -273,9 +461,10 @@ const char* replyValue(const char* reply) {
   return v;
 }
 
+// Exactly four digits and nothing after (the charger replies ">0 11 0267" with no trailing text)
 bool isDigits4(const char* s) {
   for (int i = 0; i < 4; i++) if (s[i] < '0' || s[i] > '9') return false;
-  return s[4] == 0 || s[4] == ' ';
+  return s[4] == 0;
 }
 
 bool valueValid(Purpose p, const char* v) {
@@ -289,6 +478,45 @@ bool valueValid(Purpose p, const char* v) {
   return false;
 }
 
+// Raw current values that make sense: 0000 / 1000 (no current) or MIN_A..MAX_A (raw = A / 0.06).
+bool curRawPlausible(const char* v) {
+  long r = atol(v);
+  if (r == 0 || r == 1000) return true;
+  return r >= lround(MIN_A / 0.06) - 1 && r <= lround(MAX_A / 0.06) + 1;
+}
+
+// The value held for a read purpose (nullptr for purposes that are not confirmed)
+AblValue* heldValue(Purpose p) {
+  switch (p) {
+    case P_STATUS: return &ablStatus;
+    case P_CUR:    return &ablCur;
+    case P_DEF:    return &ablDef;
+    default:       return nullptr;
+  }
+}
+
+const char* heldText(Purpose p) {
+  AblValue* a = heldValue(p);
+  return a && a->have ? a->raw : "-";
+}
+
+bool confirmed(Purpose p, const char* v) {
+  AblValue* a = heldValue(p);
+  if (!a) return true;                                         // firmware string, write ack
+  if (a->have && !strcmp(a->raw, v)) return true;              // unchanged
+  if (p == P_CUR && expectCurRaw >= 0 && atol(v) == expectCurRaw) return true;  // what we just wrote
+  return candVal[0] && !strcmp(candVal, v);                    // seen twice in a row
+}
+
+// An earlier candidate in this job turned out to be wrong: count and log it
+void dropCandidate() {
+  if (!candVal[0]) return;
+  counters.rejected++;
+  anomAdd(A_UNCONFIRMED, cur.cmd, heldText(cur.purpose), candRaw, candRawLen);
+  candVal[0] = 0;
+  candRawLen = 0;
+}
+
 void store(AblValue& a, const char* v, const char* name) {
   if (!a.have || strcmp(a.raw, v) != 0) LOGI("%s = %s", name, v);
   strlcpy(a.raw, v, sizeof a.raw);
@@ -296,14 +524,27 @@ void store(AblValue& a, const char* v, const char* name) {
   a.ms = millis();
 }
 
-// Converts a 4-digit current value (duty x10, A = value x 0.06). -1 if unknown.
+// Converts a 4-digit current value (duty x10, A = value x 0.06; 1000 = no current). -1 if unknown.
 float ablAmps(const AblValue& a) {
   if (!a.have) return -1;
-  return round(atol(a.raw) * 0.06 * 10) / 10.0;
+  long r = atol(a.raw);
+  if (r >= 1000) return 0;
+  return round(r * 0.06 * 10) / 10.0;
 }
 
 void sendAttempt() {
-  while (rs.available()) rs.read();  // drop stale bytes
+  // Bytes waiting now belong to no request (e.g. a late reply). Drop them, but count and log them.
+  if (rs.available()) {
+    uint8_t b[24];
+    size_t n = 0, total = 0;
+    while (rs.available()) {
+      uint8_t c = rs.read();
+      total++;
+      if (n < sizeof b) b[n++] = c;
+    }
+    counters.stray += total;
+    anomAdd(A_STRAY, cur.cmd, "-", b, n);
+  }
   rs.print(cur.cmd);
   rs.print("\r\n");
   rawAdd(true, cur.cmd);
@@ -311,13 +552,16 @@ void sendAttempt() {
   sendNo++;
   tAttempt = millis();
   rxLen = 0;
+  rxRawLen = 0;
   bs = BS_WAIT;
 }
 
 void finishJob() {
+  if (!gotValid) dropCandidate();   // a changed value that was never confirmed - keep the held one
   res.done = true;
   res.ok = gotValid;
   if (!gotValid && !res.err[0]) strlcpy(res.err, "timeout", sizeof res.err);
+  if (isWrite(cur.purpose) && res.ok) expectCurRaw = cur.raw;
   if (isWrite(cur.purpose)) {
     cmdAdd(cur.amps, cur.raw, cur.source, res.ok, res.err);
     logf(res.ok ? L_INFO : L_ERR, "set %d A (%s): %s %s", cur.amps, cur.cmd, res.ok ? "OK" : "FAILED", res.ok ? "" : res.err);
@@ -352,23 +596,40 @@ void handleReply() {
     counters.recv++;
     lastValidMs = millis();
     everValid = true;
-    if (!gotValid) {
+    if (gotValid) {
+      // already settled (second transmission of a write) - nothing to do
+    } else if (cur.purpose == P_CUR && !curRawPlausible(v)) {
+      // never publish an impossible current limit
+      counters.rejected++;
+      strlcpy(res.err, "current out of range", sizeof res.err);
+      anomAdd(A_RANGE, cur.cmd, heldText(cur.purpose), rxRaw, rxRawLen);
+    } else if (confirmed(cur.purpose, v)) {
+      if (candVal[0] && strcmp(candVal, v)) dropCandidate();   // the earlier odd value was a glitch
+      candVal[0] = 0;
       gotValid = true;
       res.err[0] = 0;
       res.ms = millis() - tJobStart;
       strlcpy(res.rx, rxBuf, sizeof res.rx);
       switch (cur.purpose) {
         case P_STATUS: store(ablStatus, v, "status (!0 02)"); break;
-        case P_CUR:    store(ablCur, v, "current limit (!0 11)"); break;
+        case P_CUR:    store(ablCur, v, "current limit (!0 11)"); expectCurRaw = -1; break;
         case P_DEF:    store(ablDef, v, "default current (!0 26)"); break;
         case P_FW:     store(ablFw, v, "charger firmware (!0 01)"); break;
         case P_SET:    break;
       }
+    } else {
+      // changed value seen once: read again before believing it
+      dropCandidate();   // a different unconfirmed value earlier in this job
+      strlcpy(candVal, v, sizeof candVal);
+      candRawLen = (uint8_t)min(rxRawLen, sizeof candRaw);
+      memcpy(candRaw, rxRaw, candRawLen);
+      strlcpy(res.err, "value not confirmed", sizeof res.err);
+      LOGD("%s: new value %s (held %s) - reading again to confirm", cur.cmd, v, heldText(cur.purpose));
     }
   } else {
     counters.invalid++;
     if (!gotValid) strlcpy(res.err, "invalid reply", sizeof res.err);
-    LOGW("invalid reply to %s: %s", cur.cmd, rxBuf);
+    anomAdd(A_INVALID, cur.cmd, heldText(cur.purpose), rxRaw, rxRawLen);
   }
   attemptEnded();
 }
@@ -385,6 +646,8 @@ void rsTick() {
       res.id = cur.id;
       sendNo = 0;
       gotValid = false;
+      candVal[0] = 0;
+      candRawLen = 0;
       tJobStart = now;
       sendAttempt();
       return;
@@ -392,6 +655,7 @@ void rsTick() {
     case BS_WAIT:
       while (rs.available()) {
         char c = (char)rs.read();
+        if (c != '\n' && rxRawLen < sizeof rxRaw) rxRaw[rxRawLen++] = (uint8_t)c;
         if (c == '\r') continue;
         if (c == '\n') { if (rxLen) { handleReply(); return; } continue; }
         if (rxLen < RXMAX - 1) rxBuf[rxLen++] = (c >= 0x20 && c < 0x7F) ? c : '.';
@@ -489,6 +753,15 @@ void fillStatus(JsonDocument& d) {
   c["recv"] = counters.recv;
   c["invalid"] = counters.invalid;
   c["timeouts"] = counters.timeouts;
+  c["rejected"] = counters.rejected;
+  c["stray"] = counters.stray;
+  c["anomalies"] = anomSinceBoot;
+  d["anomaly_log_entries"] = anomHdr.count + anomPendingN;
+  d["boot_no"] = anomHdr.bootNo;
+  d["fs_ok"] = fsOk;
+  char ts[24];
+  fmtLocalTime(nowEpoch(), ts, sizeof ts);
+  if (ts[0]) d["time"] = ts; else d["time"] = nullptr;
   d["mac"] = WiFi.macAddress();   // stable ID for the HA integration
   d["uptime_s"] = (uint32_t)(uptimeMs() / 1000);
   d["rssi"] = WiFi.RSSI();
@@ -557,6 +830,60 @@ void handleLog() {
   chunk += "]}";
   server.sendContent(chunk);
   server.sendContent("");
+}
+
+void anomJson(String& o, const AnomalyRec& r) {
+  char ts[24], hx[80], rxs[sizeof r.rx + 1];
+  fmtLocalTime(r.epoch, ts, sizeof ts);
+  bytesToHex(r.rx, r.rxLen, hx, sizeof hx);
+  for (uint8_t i = 0; i < r.rxLen; i++) rxs[i] = (r.rx[i] >= 0x20 && r.rx[i] < 0x7F) ? (char)r.rx[i] : '.';
+  rxs[r.rxLen] = 0;
+  char cmd[sizeof r.cmd + 1], stored[sizeof r.stored + 1];
+  strlcpy(cmd, r.cmd, sizeof cmd);
+  strlcpy(stored, r.stored, sizeof stored);
+  o += "{\"time\":";
+  if (ts[0]) o += jsonStr(ts); else o += "null";
+  o += ",\"uptime_s\":"; o += r.uptimeS;
+  o += ",\"boot\":"; o += r.bootNo;
+  o += ",\"kind\":"; o += jsonStr(r.kind <= A_SUPPRESSED ? ANOM_NAME[r.kind] : "?");
+  o += ",\"cmd\":"; o += jsonStr(cmd);
+  o += ",\"held\":"; o += jsonStr(stored);
+  o += ",\"ascii\":"; o += jsonStr(rxs);
+  o += ",\"hex\":"; o += jsonStr(hx);
+  if (r.kind == A_SUPPRESSED) { o += ",\"suppressed\":"; o += r.extra; }
+  o += '}';
+}
+
+// GET /api/anomalies: persistent log of rejected/odd frames, newest first (token required)
+void handleAnomalies() {
+  if (!requireToken()) return;
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  String chunk;
+  chunk.reserve(600);
+  chunk = "{\"boot_no\":";
+  chunk += anomHdr.bootNo;
+  chunk += ",\"fs_ok\":"; chunk += fsOk ? "true" : "false";
+  chunk += ",\"not_written\":"; chunk += anomSuppressed;
+  chunk += ",\"entries\":[";
+  bool first = true;
+  anomForEach(ANOM_N + ANOM_PENDING_N, [&](const AnomalyRec& r) {
+    if (!first) chunk += ',';
+    first = false;
+    anomJson(chunk, r);
+    if (chunk.length() > 450) { server.sendContent(chunk); chunk = ""; }
+  });
+  chunk += "]}";
+  server.sendContent(chunk);
+  server.sendContent("");
+}
+
+// POST /api/anomalies/clear (token required)
+void handleAnomaliesClear() {
+  if (!requireToken()) return;
+  anomClear();
+  LOGI("anomaly log cleared via REST");
+  server.send(200, "application/json", "{\"cleared\":true}");
 }
 
 void noteCommand(const char* source) {
@@ -689,7 +1016,9 @@ async function tick(){
   $('sp').textContent='setpoint '+(s.setpoint_a==null?'–':s.setpoint_a+' A')+' · allowed '+s.min_a+'–'+s.max_a+' A · source '+s.last_command_source;
   const c=s.counters,rows=[['Default current',s.default_a==null?'–':s.default_a+' A (raw '+s.default_raw+')'],
   ['Charger firmware',s.charger_fw??'–'],
-  ['Counters',`sent ${c.sent} · received ${c.recv} · invalid ${c.invalid} · timeouts ${c.timeouts}`],
+  ['Counters',`sent ${c.sent} · received ${c.recv} · invalid ${c.invalid} · timeouts ${c.timeouts} · rejected ${c.rejected} · stray ${c.stray}`],
+  ['Anomaly log',`${s.anomaly_log_entries} entries (${c.anomalies} since boot) · boot #${s.boot_no}${s.fs_ok?'':' · FS ERROR'}`],
+  ['Time',s.time??'not synced'],
   ['WiFi signal',s.rssi+' dBm'],['Free heap',s.heap_free+' B'],['Uptime',dur(s.uptime_s)],['Firmware',s.fw_version],['Build time',s.build_time],
   ['Last reset',s.reset_reason],['Log level',s.log_level]];
   $('sys').innerHTML=rows.map(r=>`<tr><th>${r[0]}</th><td>${esc(r[1])}</td></tr>`).join('');
@@ -732,8 +1061,27 @@ void telnetStatus() {
           ablCur.have ? ablCur.raw : "-", ablAmps(ablCur), ablDef.have ? ablDef.raw : "-", ablAmps(ablDef), MIN_A, MAX_A);
   tprintf("setpoint: %d A  last command: %s, %ld s ago\r\n", setpointA, lastCmdSource,
           haveCmd ? (long)((millis() - lastCmdMs) / 1000) : -1L);
-  tprintf("counters: sent %u received %u invalid %u timeouts %u  log level %s  queue %u\r\n",
-          counters.sent, counters.recv, counters.invalid, counters.timeouts, LVL_NAME[logLevel], qCount);
+  tprintf("counters: sent %u received %u invalid %u timeouts %u rejected %u stray %u  log level %s  queue %u\r\n",
+          counters.sent, counters.recv, counters.invalid, counters.timeouts, counters.rejected, counters.stray,
+          LVL_NAME[logLevel], qCount);
+  tprintf("boot #%u  anomaly log %u entries (%u since boot)  fs %s\r\n", anomHdr.bootNo,
+          anomHdr.count + anomPendingN, anomSinceBoot, fsOk ? "ok" : "ERROR");
+}
+
+void telnetAnomalies() {
+  tprintf("-- anomalies (newest first, max 30) --\r\n");
+  uint16_t n = anomForEach(30, [](const AnomalyRec& r) {
+    char ts[24], hx[80];
+    fmtLocalTime(r.epoch, ts, sizeof ts);
+    bytesToHex(r.rx, r.rxLen, hx, sizeof hx);
+    char cmd[sizeof r.cmd + 1], held[sizeof r.stored + 1];
+    strlcpy(cmd, r.cmd, sizeof cmd);
+    strlcpy(held, r.stored, sizeof held);
+    tprintf("%-19s boot %u up %lus %-12s %-6s held %-5s rx [%s]%s\r\n", ts[0] ? ts : "-", r.bootNo,
+            (unsigned long)r.uptimeS, r.kind <= A_SUPPRESSED ? ANOM_NAME[r.kind] : "?", cmd, held, hx,
+            r.kind == A_SUPPRESSED ? " (entries not written)" : "");
+  });
+  if (!n) tprintf("(none)\r\n");
 }
 
 void telnetLog() {
@@ -768,9 +1116,11 @@ void telnetCommand(char* line) {
   if (!cmd) return;
   char* a1 = strtok(nullptr, " ");
   if (!strcasecmp(cmd, "help")) {
-    tprintf("status | log | level debug|info|warn | reboot | help | quit\r\n");
+    tprintf("status | log | anomalies | level debug|info|warn | reboot | help | quit\r\n");
   } else if (!strcasecmp(cmd, "status")) {
     telnetStatus();
+  } else if (!strcasecmp(cmd, "anomalies")) {
+    telnetAnomalies();
   } else if (!strcasecmp(cmd, "log")) {
     telnetLog();
   } else if (!strcasecmp(cmd, "level")) {
@@ -893,6 +1243,9 @@ void setup() {
   rs.begin(RS_BAUD, SWSERIAL_8N1, D7, D8, false, 256);  // RX=D7, TX=D8
   if (!rs) LOGE("SoftwareSerial init failed");
 
+  anomBegin();
+  configTime(TZ_INFO, NTP_SERVER);
+
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.hostname(HOSTNAME);
@@ -915,6 +1268,8 @@ void setup() {
   server.on("/api/current", HTTP_POST, handleCurrent);
   server.on("/api/resume", HTTP_POST, handleResume);
   server.on("/api/auth", HTTP_GET, handleAuth);
+  server.on("/api/anomalies", HTTP_GET, handleAnomalies);
+  server.on("/api/anomalies/clear", HTTP_POST, handleAnomaliesClear);
   server.on("/api/debug/loglevel", HTTP_POST, handleLogLevel);
   server.on("/api/debug/reboot", HTTP_POST, handleReboot);
   server.onNotFound([]() { sendError(404, "not found"); });
@@ -947,6 +1302,7 @@ void loop() {
     otaStartMs = 0;
   }
   rsTick();
+  if (!otaActive && bs == BS_IDLE) anomTick();   // flash writes only between RS485 jobs
 
   if (!otaActive && bs == BS_IDLE && qCount == 0 && now - lastPollMs >= POLL_MS) {
     lastPollMs = now;

@@ -59,7 +59,9 @@
       "default_current": { "name": "Default charging current" },
       "status_code": { "name": "Status code" },
       "charger_firmware": { "name": "Charger firmware" },
-      "wifi_signal": { "name": "WiFi signal" }
+      "wifi_signal": { "name": "WiFi signal" },
+      "rejected_readings": { "name": "Rejected readings" },
+      "anomaly_log_entries": { "name": "Anomaly log entries" }
     }
   }
 }

@@ -25,3 +25,8 @@
 // Highest charging current (A) HA may set. Default 16, never above 30. Must not exceed
 // what the circuit and the charger's own default/maximum allow.
 #define MAX_A          16
+
+// Optional: NTP server for timestamps in the anomaly log (default pool.ntp.org; your router also works)
+// and the POSIX time zone (default Europe/Oslo).
+// #define NTP_SERVER "pool.ntp.org"
+// #define TZ_INFO    "CET-1CEST,M3.5.0,M10.5.0/3"

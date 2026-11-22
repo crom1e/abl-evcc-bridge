@@ -40,6 +40,7 @@ class SaltoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = api
         self._last_connected: float | None = None
         self._charger_fw: str | None = None
+        self._warned_current: set[Any] = set()
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:
@@ -53,6 +54,7 @@ class SaltoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def derive(self, data: dict[str, Any]) -> dict[str, Any]:
         """Add fields used by the entities. Also applied to the /api/current response."""
         data = dict(data)
+        self._sanitize_current(data)
         code = data.get("status_code")
         now = time.monotonic()
 
@@ -73,3 +75,28 @@ class SaltoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         data["_charging"] = code == CODE_CHARGING
         data["_charger_fw"] = self._charger_fw
         return data
+
+    def _sanitize_current(self, data: dict[str, Any]) -> None:
+        """Never expose an impossible current limit (e.g. a corrupted read-back).
+
+        The bridge already rejects such values; this is a second line of defence so an
+        automation can never act on them. Valid: 0 (no current) or min_a..max_a.
+        """
+        amps = data.get("applied_a")
+        if amps is None:
+            return
+        lo = data.get("min_a") or 6
+        hi = data.get("max_a") or 16
+        if amps == 0 or lo <= amps <= hi:
+            return
+        if amps not in self._warned_current:
+            self._warned_current.add(amps)
+            _LOGGER.warning(
+                "Ignoring implausible current limit %s A from the bridge (raw %s, allowed 0 or %s-%s A)",
+                amps,
+                data.get("applied_raw"),
+                lo,
+                hi,
+            )
+        data["applied_a"] = None
+        data["applied_raw"] = None

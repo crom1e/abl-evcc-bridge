@@ -112,7 +112,7 @@ During OTA, RS485 polling stops and the charger is not touched. After the reboot
 ```bash
 telnet <ip> 23        # first line: the API token
 ```
-Commands: `help`, `status`, `log`, `level debug|info|warn`, `reboot`, `quit`.
+Commands: `help`, `status`, `log`, `anomalies`, `level debug|info|warn`, `reboot`, `quit`.
 Telnet shows the same log lines as USB serial (`[millis] LEVEL message`). With `level debug` every TX/RX frame is shown. One client at a time. A wrong token disconnects.
 
 Non-interactive: `tools/salto.sh telnet status log` or `tools/salto.sh tail 60`.
@@ -127,6 +127,7 @@ H="Authorization: Bearer $SALTO_TOKEN"; J="Content-Type: application/json"
 curl http://<ip>/api/status
 curl http://<ip>/api/log
 curl -H "$H" http://<ip>/api/auth
+curl -H "$H" http://<ip>/api/anomalies
 curl -X POST -H "$H" -H "$J" -d '{"amps": 10}'      http://<ip>/api/current        # 6..MAX_A
 curl -X POST -H "$H" -H "$J" -d '{"level": "debug"}' http://<ip>/api/debug/loglevel
 curl -X POST -H "$H" http://<ip>/api/debug/reboot
@@ -137,6 +138,8 @@ curl -X POST -H "$H" http://<ip>/api/debug/reboot
 | `GET /api/status` | see the fields below |
 | `GET /api/log` | `commands[]`: last 20 (`ms, amps, raw, source, ok, error`). `frames[]`: last 50 RS485 frames (`ms, dir tx/rx, ascii, hex`). Both newest first. `now_ms` = current millis. |
 | `GET /api/auth` | `{"ok": true}` if the token is valid. Never touches the charger. |
+| `GET /api/anomalies` | Persistent log (token required): the last 100 rejected or odd frames, newest first, kept across reboots. Each entry: `time` (local, `null` before NTP sync), `uptime_s`, `boot`, `kind` (`invalid`, `out_of_range`, `unconfirmed`, `stray`, `suppressed`), `cmd`, `held` (value the bridge held), `ascii`, `hex`. See [reading integrity](#reading-integrity). |
+| `POST /api/anomalies/clear` | clears the anomaly log (token required) |
 | `POST /api/current {"amps": N}` | Sends `!0 12 <N/0.06>` twice and reads back with `!0 11`. Returns the status plus `command_ok` and `command_raw`. **400** if N is not an integer 6..MAX_A, or is 0 (pause is not supported). **502** if the charger did not acknowledge or replied `ERR`. |
 | `POST /api/resume` | **501**. The charger has no known pause/resume command. |
 | `POST /api/debug/loglevel` | `{"level": "debug\|info\|warn\|err"}` |
@@ -154,7 +157,9 @@ curl -X POST -H "$H" http://<ip>/api/debug/reboot
 | `setpoint_a` | last setpoint from HA (`null` before the first command) |
 | `min_a`, `max_a` | allowed range for `/api/current` |
 | `seconds_since_command`, `last_command_source` | when and from where the last command came |
-| `counters` | `sent`, `recv`, `invalid` (corrupted replies), `timeouts` |
+| `counters` | `sent`, `recv`, `invalid` (malformed replies), `timeouts`, `rejected` (well-formed values discarded: out of range or not confirmed), `stray` (bytes that belonged to no request), `anomalies` (anomaly log entries since boot) |
+| `anomaly_log_entries`, `boot_no`, `fs_ok` | entries in the persistent anomaly log, boot counter, filesystem OK |
+| `time` | local time from NTP (`null` until synced) |
 | `mac` | WiFi MAC address (stable device ID for HA) |
 | `uptime_s`, `rssi`, `heap_free`, `reset_reason`, `fw_version`, `build_time`, `log_level`, `ota_active` | system |
 
@@ -181,9 +186,12 @@ Give the bridge a fixed DHCP reservation.
 | Default charging current | `sensor` (A, diagnostic) | the charger's ceiling (`!0 26`) |
 | Charger firmware | `sensor` (diagnostic) | kept while charging (the charger only reports it when idle) |
 | Status code / WiFi signal | `sensor` (diagnostic, disabled by default) | raw `!0 02` code, RSSI |
+| Rejected readings / Anomaly log entries | `sensor` (diagnostic, disabled by default) | `counters.rejected`, `anomaly_log_entries` |
 | Charging | `binary_sensor` (battery_charging) | status `0005` |
 | Car connected | `binary_sensor` (plug) | status `0004`/`0005`/`0064`. Turns off only after 30 s of `0000`, which briefly appears during transitions. |
 | Charger link | `binary_sensor` (connectivity, diagnostic) | RS485 link between bridge and charger. If the bridge itself is unreachable, all entities become unavailable. |
+
+The integration never exposes a current limit outside 0 / min..max: such a value becomes *unknown* and a warning is logged.
 
 The charger does not report measured current or power. Use the vehicle's integration or your grid meter for actual consumption.
 
@@ -208,6 +216,7 @@ The bridge does not regulate on its own. Build this in HA:
   - only send changes of at least 1 A
   - the car needs 2–10 s to follow a new limit
 - The bridge has no watchdog. Send a sensible initial value when HA starts and a car is charging.
+- **Base decisions on your own last setpoint** (e.g. an `input_number`) and the grid meter, not on the read-back of the number entity. Do not clamp-and-write the read-back value: a single bad reading should never trigger a write.
 
 ---
 
@@ -227,6 +236,15 @@ ABL ASCII command protocol, **38400 8N1**, address 0. Request `!0 <cmd> [value]`
 - `!0 12` is limited internally by the charger to the default current (`!0 26`). Tested while charging: 6, 10 and 16 A work. `!0 12 1000` (0 A) returns `ERR`.
 - **Never send `!0 15`** (changes the default/ceiling permanently, reportedly up to 32 A) **or `!0 00 1111`** (reset). The bridge deliberately has no path for such commands.
 - The charger did not respond to Modbus ASCII (`:010300040001F7`) at any baud rate or parity. Newer EVCC2/3 firmware supports Modbus, this one does not.
+
+### Reading integrity
+
+The protocol has **no checksum**, and SoftwareSerial occasionally flips a bit at 38400 baud (roughly 0.3 % of replies are visibly corrupted). A flip can also turn one digit into another and still look valid: `>0 11 0183` (11 A) became `>0 11 0383` (23 A) once, and an automation acted on it. The bridge therefore:
+
+- accepts only replies of exactly the form `>0 XX NNNN` for the command that was sent, and flushes the receive buffer before every request (leftover bytes are counted as `stray`);
+- **never publishes a current limit outside 0 / 6..MAX_A** (`0000` and `1000` mean no current);
+- **accepts a changed value only when a second read returns the same value** (up to 3 reads per poll), or when it is the value just written. Otherwise the previous value is kept;
+- counts discarded values in `counters.rejected` and writes them, with raw hex, to the persistent anomaly log (`GET /api/anomalies`, telnet `anomalies`). The log lives in LittleFS, is written at most every 10 s and at most 30 entries per hour to spare the flash, and survives reboots and OTA updates.
 
 ### Status codes
 

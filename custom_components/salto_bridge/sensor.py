@@ -94,6 +94,19 @@ SENSORS: tuple[SaltoSensorDescription, ...] = (
         entity_registry_enabled_default=False,
         value_fn=lambda d: d.get("rssi"),
     ),
+    SaltoSensorDescription(
+        key="rejected_readings",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=lambda d: (d.get("counters") or {}).get("rejected"),
+    ),
+    SaltoSensorDescription(
+        key="anomaly_log_entries",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=lambda d: d.get("anomaly_log_entries"),
+    ),
 )
 
 
